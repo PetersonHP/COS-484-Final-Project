@@ -19,15 +19,15 @@ Observation (129-dim float32):
   [0:52]    agent hand (binary)
   [52:104]  cards played in completed tricks this round (binary)
   [104:107] current trick card slots (card/52, -1 if empty)
-  [107:110] bids per player normalized by n_cards (-1 if unplaced)
-  [110:113] tricks won per player normalized by n_cards
+  [107:110] bids per player normalized by n_cards (-1 if unplaced)  -- rotated: [0]=self
+  [110:113] tricks won per player normalized by n_cards              -- rotated: [0]=self
   [113:117] trump suit one-hot
   [117:122] lead suit one-hot (index 4 = no lead set)
   [122]     phase (0=bidding, 1=playing)
   [123]     tricks_played / n_cards  (within-round progress)
   [124]     round_num / n_rounds     (across-round progress)
   [125]     n_cards / max_cards
-  [126:129] cumulative scores per player, normalized by theoretical max
+  [126:129] cumulative scores per player, normalized by theoretical max -- rotated: [0]=self
 """
 
 import random
@@ -76,12 +76,20 @@ class JudgementEnv(gym.Env):
 
     metadata = {'render_modes': ['human']}
 
-    def __init__(self, max_cards: int = MAX_CARDS, render_mode=None):
+    def __init__(self, max_cards: int = MAX_CARDS, render_mode=None,
+                 opponent_model=None):
+        """
+        Args:
+            opponent_model: an ActorCritic (or any callable with the same
+                            forward signature) used instead of heuristics for
+                            P2 and Dealer.  Pass None to use heuristics.
+        """
         super().__init__()
-        self.max_cards  = max_cards
-        self.n_rounds   = max_cards
+        self.max_cards   = max_cards
+        self.n_rounds    = max_cards
         self.render_mode = render_mode
-        self.n_players  = 3
+        self.n_players   = 3
+        self.opponent_model = opponent_model
 
         self.action_space      = spaces.Discrete(52)
         self.observation_space = spaces.Box(-1.0, 1.0, shape=(OBS_DIM,), dtype=np.float32)
@@ -95,7 +103,7 @@ class JudgementEnv(gym.Env):
         self.n_cards           = max_cards
         self.trump_suit        = 0
         self.cumulative_scores = [0, 0, 0]
-        self.round_scores      = []        # list of per-round agent scores
+        self.round_scores      = []
         self.hands             = [[], [], []]
         self.bids              = [None, None, None]
         self.tricks_won        = [0, 0, 0]
@@ -210,53 +218,89 @@ class JudgementEnv(gym.Env):
         self.phase         = 'bidding'
 
     # ------------------------------------------------------------------
-    # Observation and action mask
+    # Observation and action mask  (per-player)
     # ------------------------------------------------------------------
 
     def _get_obs(self) -> np.ndarray:
+        """Agent (P0) observation — kept for gym compatibility."""
+        return self._get_obs_for_player(0)
+
+    def _get_obs_for_player(self, player: int) -> np.ndarray:
+        """
+        129-dim observation from the perspective of `player`.
+        Slots [107:110], [110:113], [126:129] are rotated so index 0 = self,
+        which lets the same network generalise across seats.
+        """
         obs = np.full(OBS_DIM, -1.0, dtype=np.float32)
 
-        for c in self.hands[0]:
+        # [0:52] own hand
+        for c in self.hands[player]:
             obs[c] = 1.0
 
+        # [52:104] cards played in completed tricks
         obs[52:104] = 0.0
         for c in self.played_cards:
             obs[52 + c] = 1.0
 
+        # [104:107] current trick slots (card index / 52, or -1)
         for i in range(3):
             obs[104 + i] = (self.current_trick[i][1] / 52.0
                             if i < len(self.current_trick) else -1.0)
 
+        # [107:110] bids — rotated so [0] = self
         for i in range(3):
-            obs[107 + i] = (self.bids[i] / self.n_cards
-                            if self.bids[i] is not None else -1.0)
+            p = (player + i) % 3
+            obs[107 + i] = (self.bids[p] / self.n_cards
+                            if self.bids[p] is not None else -1.0)
 
+        # [110:113] tricks won — rotated
         for i in range(3):
-            obs[110 + i] = self.tricks_won[i] / self.n_cards
+            p = (player + i) % 3
+            obs[110 + i] = self.tricks_won[p] / self.n_cards
 
+        # [113:117] trump suit one-hot
         obs[113:117] = 0.0
         obs[113 + self.trump_suit] = 1.0
 
+        # [117:122] lead suit one-hot (4 = no lead)
         obs[117:122] = 0.0
         obs[117 + (self.lead_suit if self.lead_suit is not None else 4)] = 1.0
 
+        # scalars
         obs[122] = 0.0 if self.phase == 'bidding' else 1.0
         obs[123] = self.tricks_played / self.n_cards
         obs[124] = self.round_num / self.n_rounds
         obs[125] = self.n_cards / self.max_cards
 
+        # [126:129] cumulative scores — rotated
         for i in range(3):
-            obs[126 + i] = self.cumulative_scores[i] / _MAX_SCORE
+            p = (player + i) % 3
+            obs[126 + i] = self.cumulative_scores[p] / _MAX_SCORE
 
         return obs
 
     def _get_action_mask(self) -> np.ndarray:
+        """Agent (P0) action mask — kept for gym compatibility."""
+        return self._get_action_mask_for_player(0)
+
+    def _get_action_mask_for_player(self, player: int) -> np.ndarray:
+        """
+        52-dim boolean mask for `player`.
+        Dealer (always the last to bid in the sequence 0→1→2) cannot bid a
+        value that makes the sum equal n_cards.
+        """
         mask = np.zeros(52, dtype=bool)
         if self.phase == 'bidding':
+            is_dealer = (player == 2)
+            forbidden = None
+            if is_dealer:
+                others = sum(b for b in self.bids if b is not None)
+                forbidden = self.n_cards - others
             for b in range(self.n_cards + 1):
-                mask[b] = True           # agent is never dealer, no constraint
+                if b != forbidden:
+                    mask[b] = True
         else:
-            for c in self._legal_cards(0):
+            for c in self._legal_cards(player):
                 mask[c] = True
         return mask
 
@@ -321,10 +365,35 @@ class JudgementEnv(gym.Env):
         return float(10 + bid) if won == bid else 0.0
 
     # ------------------------------------------------------------------
-    # Opponent heuristics
+    # Opponent logic  (heuristic fallback OR model-driven)
     # ------------------------------------------------------------------
 
     def _auto_bid(self, player: int):
+        """Bid for player.  Uses opponent_model if set, else heuristic."""
+        if self.opponent_model is not None:
+            import torch
+            obs  = self._get_obs_for_player(player)
+            mask = self._get_action_mask_for_player(player)
+            obs_t  = torch.from_numpy(obs).unsqueeze(0)
+            mask_t = torch.from_numpy(mask).unsqueeze(0)
+            with torch.no_grad():
+                logits, _ = self.opponent_model(obs_t, mask_t)
+            bid = int(logits.argmax(dim=-1).item())
+            # Safety: clamp to legal range (model may output card indices in bidding)
+            bid = max(0, min(bid, self.n_cards))
+            if player == 2:  # enforce dealer constraint
+                others = sum(b for b in self.bids if b is not None)
+                if others + bid == self.n_cards:
+                    # pick nearest legal alternative
+                    for candidate in [bid + 1, bid - 1] + list(range(self.n_cards + 1)):
+                        candidate = max(0, min(candidate, self.n_cards))
+                        if others + candidate != self.n_cards:
+                            bid = candidate
+                            break
+            self.bids[player] = bid
+            return
+
+        # ── Heuristic fallback ──────────────────────────────────────────
         hand = self.hands[player]
         bid  = sum(
             1 for c in hand
@@ -345,6 +414,23 @@ class JudgementEnv(gym.Env):
         self.bids[player] = bid
 
     def _opponent_play(self, player: int) -> int:
+        """Play a card for player.  Uses opponent_model if set, else heuristic."""
+        if self.opponent_model is not None:
+            import torch
+            obs  = self._get_obs_for_player(player)
+            mask = self._get_action_mask_for_player(player)
+            obs_t  = torch.from_numpy(obs).unsqueeze(0)
+            mask_t = torch.from_numpy(mask).unsqueeze(0)
+            with torch.no_grad():
+                logits, _ = self.opponent_model(obs_t, mask_t)
+            # mask already applied inside model.forward, but double-check legality
+            legal = np.where(mask)[0]
+            action = int(logits.argmax(dim=-1).item())
+            if action not in legal:
+                action = int(np.random.choice(legal))
+            return action
+
+        # ── Heuristic fallback ──────────────────────────────────────────
         legal = self._legal_cards(player)
         if not self.current_trick:
             trumps = [c for c in legal if c // 13 == self.trump_suit]
@@ -363,9 +449,8 @@ class JudgementEnv(gym.Env):
     # Pygame rendering
     # ------------------------------------------------------------------
 
-    # Layout constants
     _W,   _H   = 1150, 780
-    _CW,  _CH  = 52,   76      # card width / height
+    _CW,  _CH  = 52,   76
     _GAP        = 4
 
     _COL_BG     = (34, 100, 34)
@@ -374,9 +459,9 @@ class JudgementEnv(gym.Env):
     _COL_WHITE  = (255, 255, 255)
     _COL_TEXT   = (235, 255, 235)
     _COL_BACK   = ( 60,  90, 180)
-    _COL_TRUMP  = (255, 210,   0)   # gold border for trump cards
-    _COL_LEGAL  = ( 50, 230, 120)   # green border for legal plays
-    _COL_SLOT   = ( 50, 130,  50)   # empty trick slot
+    _COL_TRUMP  = (255, 210,   0)
+    _COL_LEGAL  = ( 50, 230, 120)
+    _COL_SLOT   = ( 50, 130,  50)
 
     def _init_pygame(self):
         if not _PYGAME_AVAILABLE:
@@ -401,14 +486,11 @@ class JudgementEnv(gym.Env):
         else:
             suit, rank = idx // 13, idx % 13
             col = SUIT_COLORS[suit]
-            # rank top-left
             r_surf = self._font_sm.render(RANKS[rank], True, col)
             surf.blit(r_surf, (x + 3, y + 2))
-            # suit symbol center
             s_surf = self._font.render(SUIT_SYMBOLS[suit], True, col)
             s_rect = s_surf.get_rect(center=(x + self._CW // 2, y + self._CH // 2))
             surf.blit(s_surf, s_rect)
-            # trump gold border
             border_col = self._COL_TRUMP if suit == self.trump_suit else (160, 160, 160)
             border_w   = 2 if suit == self.trump_suit else 1
             pygame.draw.rect(surf, border_col, rect, border_w, border_radius=4)
@@ -424,7 +506,6 @@ class JudgementEnv(gym.Env):
     def _render_pygame(self):
         self._init_pygame()
 
-        # pump events so window stays alive
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 pygame.quit()
@@ -438,7 +519,6 @@ class JudgementEnv(gym.Env):
         trump_sym  = SUIT_SYMBOLS[self.trump_suit]
         trump_name = SUIT_NAMES[self.trump_suit]
 
-        # ── Header ────────────────────────────────────────────────────
         pygame.draw.rect(surf, self._COL_HDR, (0, 0, W, 48))
         self._text(surf,
             f"Round {self.round_num + 1} / {self.n_rounds}   "
@@ -447,7 +527,6 @@ class JudgementEnv(gym.Env):
             f"Phase: {'BIDDING' if self.phase == 'bidding' else 'PLAYING'}",
             10, 8, self._font_lg)
 
-        # ── Score bar ─────────────────────────────────────────────────
         pygame.draw.rect(surf, self._COL_PANEL, (0, 48, W, 32))
         score_parts = [
             f"You: {self.cumulative_scores[0]}",
@@ -459,9 +538,7 @@ class JudgementEnv(gym.Env):
             score_parts.append(f"Last round: {self.round_scores[-1]:.0f}")
         self._text(surf, "Scores —  " + "   |   ".join(score_parts), 10, 54)
 
-        y = 90   # running y cursor
-
-        # ── Opponents (side by side) ───────────────────────────────────
+        y = 90
         half = W // 2 - 20
 
         def draw_opponent(player: int, ox: int, label: str):
@@ -480,7 +557,6 @@ class JudgementEnv(gym.Env):
 
         y += 22 + CH + 18
 
-        # ── Current trick ─────────────────────────────────────────────
         pygame.draw.rect(surf, self._COL_PANEL, (0, y - 4, W, CH + 50))
         self._text(surf, "Current Trick", W // 2 - 60, y)
         y += 22
@@ -500,7 +576,6 @@ class JudgementEnv(gym.Env):
                 pygame.draw.rect(surf, self._COL_SLOT,
                                  (slot_x, y, CW, CH), 2, border_radius=4)
 
-        # trick winner label (if trick just completed)
         if self.tricks_played > 0 and not self.current_trick:
             last_winner = self.trick_leader
             self._text(surf,
@@ -510,7 +585,6 @@ class JudgementEnv(gym.Env):
 
         y += CH + 44
 
-        # ── Agent hand ────────────────────────────────────────────────
         bid_str = str(self.bids[0]) if self.bids[0] is not None else '?'
         self._text(surf,
             f"Your Hand   bid: {bid_str}   won: {self.tricks_won[0]}   "
@@ -531,7 +605,6 @@ class JudgementEnv(gym.Env):
                 highlight = self._COL_LEGAL if is_legal else None
                 self._draw_card(surf, card, cx, y, highlight=highlight)
 
-        # ── Status bar ────────────────────────────────────────────────
         pygame.draw.rect(surf, self._COL_HDR, (0, self._H - 36, W, 36))
         if self.phase == 'bidding':
             status = f"BIDDING — choose a bid from 0 to {self.n_cards}"
@@ -548,42 +621,34 @@ class JudgementEnv(gym.Env):
 # ---------------------------------------------------------------------------
 
 if __name__ == '__main__':
-    import time
+    import argparse, time
 
-    env = JudgementEnv(max_cards=17, render_mode='human')
-    obs, info = env.reset(seed=0)
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--render', action='store_true', help='Show pygame window')
+    parser.add_argument('--games', type=int, default=5)
+    args = parser.parse_args()
 
-    print("=== Judgement — 17-round game ===")
+    render_mode = 'human' if args.render else None
+    env = JudgementEnv(max_cards=17, render_mode=render_mode)
+    scores = []
 
-    terminated = False
-    total_reward = 0.0
-    step_num = 0
+    for game in range(args.games):
+        obs, info = env.reset(seed=game)
+        terminated, total = False, 0.0
 
-    while not terminated:
-        mask  = info['action_mask']
-        valid = np.where(mask)[0]
+        while not terminated:
+            mask  = info['action_mask']
+            valid = np.where(mask)[0]
+            action = int(valid[len(valid)//2]) if env.phase == 'bidding' else int(np.random.choice(valid))
+            obs, reward, terminated, _, info = env.step(action)
+            total += reward
+            if args.render:
+                time.sleep(0.1)
 
-        if env.phase == 'bidding':
-            action = int(valid[len(valid) // 2])   # middle bid
-        else:
-            action = int(np.random.choice(valid))   # random legal card
+        scores.append(total)
+        print(f"Game {game}: {total:.0f}")
 
-        obs, reward, terminated, truncated, info = env.step(action)
-        total_reward += reward
-
-        if reward > 0:
-            r = info['round'] - 1  # round that just finished
-            print(f"  Round {r:2d}: bid={info['bids'][0]}  won={info['tricks_won'][0]}  "
-                  f"reward={reward:.0f}  cumulative={info['cumulative_scores'][0]:.0f}")
-
-        time.sleep(0.3)   # slow down so UI is watchable
-        step_num += 1
-
-    print(f"\n=== Game over after {step_num} steps ===")
-    print(f"Final scores — You: {info['cumulative_scores'][0]}  "
-          f"P2: {info['cumulative_scores'][1]}  "
-          f"Dealer: {info['cumulative_scores'][2]}")
-    print(f"Your total reward: {total_reward:.0f} / {_MAX_SCORE} possible")
-
-    input("\nPress Enter to close...")
+    print(f"\nAverage: {np.mean(scores):.1f}  Std: {np.std(scores):.1f}")
+    if args.render:
+        input("Press Enter to close...")
     env.close()
