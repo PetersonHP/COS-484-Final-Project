@@ -42,10 +42,6 @@ try:
 except ImportError:
     _PYGAME_AVAILABLE = False
 
-# ---------------------------------------------------------------------------
-# Card constants
-# ---------------------------------------------------------------------------
-
 SUITS        = ['S',  'D',  'C',  'H']
 SUIT_SYMBOLS = ['♠',  '♦',  '♣',  '♥']
 SUIT_NAMES   = {0: 'Spades', 1: 'Diamonds', 2: 'Clubs', 3: 'Hearts'}
@@ -59,17 +55,9 @@ OBS_DIM      = 129
 # theoretical max score: sum of (10 + n) for n in 1..17
 _MAX_SCORE   = sum(10 + n for n in range(1, MAX_CARDS + 1))
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
 def card_display(idx: int) -> str:
     return f"{RANKS[idx % 13]}{SUIT_SYMBOLS[idx // 13]}"
 
-
-# ---------------------------------------------------------------------------
-# Environment
-# ---------------------------------------------------------------------------
 
 class JudgementEnv(gym.Env):
     """Full 17-round Judgement. See module docstring for full spec."""
@@ -113,10 +101,6 @@ class JudgementEnv(gym.Env):
         self.trick_leader      = 0
         self.tricks_played     = 0
         self.phase             = 'bidding'
-
-    # ------------------------------------------------------------------
-    # Core gym interface
-    # ------------------------------------------------------------------
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
@@ -194,10 +178,6 @@ class JudgementEnv(gym.Env):
             pygame.quit()
             self._screen = None
 
-    # ------------------------------------------------------------------
-    # Round management
-    # ------------------------------------------------------------------
-
     def _start_round(self):
         self.n_cards     = self.max_cards - self.round_num   # 17, 16, …, 1
         self.trump_suit  = TRUMP_CYCLE[self.round_num % 4]
@@ -216,10 +196,6 @@ class JudgementEnv(gym.Env):
         self.trick_leader  = 0    # P1 always leads the first trick of each round
         self.tricks_played = 0
         self.phase         = 'bidding'
-
-    # ------------------------------------------------------------------
-    # Observation and action mask  (per-player)
-    # ------------------------------------------------------------------
 
     def _get_obs(self) -> np.ndarray:
         """Agent (P0) observation — kept for gym compatibility."""
@@ -304,10 +280,6 @@ class JudgementEnv(gym.Env):
                 mask[c] = True
         return mask
 
-    # ------------------------------------------------------------------
-    # Game logic
-    # ------------------------------------------------------------------
-
     def _legal_cards(self, player: int) -> list[int]:
         hand   = self.hands[player]
         if self.lead_suit is None:
@@ -364,10 +336,6 @@ class JudgementEnv(gym.Env):
             return 0.0
         return float(10 + bid) if won == bid else 0.0
 
-    # ------------------------------------------------------------------
-    # Opponent logic  (heuristic fallback OR model-driven)
-    # ------------------------------------------------------------------
-
     def _auto_bid(self, player: int):
         """Bid for player.  Uses opponent_model if set, else heuristic."""
         if self.opponent_model is not None:
@@ -393,7 +361,7 @@ class JudgementEnv(gym.Env):
             self.bids[player] = bid
             return
 
-        # ── Heuristic fallback ──────────────────────────────────────────
+
         hand = self.hands[player]
         bid  = sum(
             1 for c in hand
@@ -430,7 +398,7 @@ class JudgementEnv(gym.Env):
                 action = int(np.random.choice(legal))
             return action
 
-        # ── Heuristic fallback ──────────────────────────────────────────
+
         legal = self._legal_cards(player)
         if not self.current_trick:
             trumps = [c for c in legal if c // 13 == self.trump_suit]
@@ -444,10 +412,6 @@ class JudgementEnv(gym.Env):
         if winning:
             return min(winning, key=lambda c: (c // 13 == self.trump_suit, c % 13))
         return min(legal, key=lambda c: c % 13)
-
-    # ------------------------------------------------------------------
-    # Pygame rendering
-    # ------------------------------------------------------------------
 
     _W,   _H   = 1150, 780
     _CW,  _CH  = 52,   76
@@ -615,10 +579,6 @@ class JudgementEnv(gym.Env):
         pygame.display.flip()
         self._clock.tick(30)
 
-
-# ---------------------------------------------------------------------------
-# Smoke test / demo
-# ---------------------------------------------------------------------------
 
 if __name__ == '__main__':
     import argparse, time
