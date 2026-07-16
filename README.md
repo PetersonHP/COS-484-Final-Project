@@ -1,5 +1,4 @@
-# COS-484-Final-Project
-# Judgement RL
+# Playing Judgement with RL · [Paper](https://drive.google.com/file/d/1xBYyfL6GBJPuadDg3msNEah1upDYd1tP/view?usp=sharing)
 
 A PPO agent trained to play Judgement, a 3-player trick-taking card game, with support for heuristic-opponent training and self-play.
 
